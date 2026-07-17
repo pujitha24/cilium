@@ -19,6 +19,7 @@ import (
 	"github.com/cilium/cilium/cilium-cli/connectivity/check"
 	"github.com/cilium/cilium/cilium-cli/utils/features"
 	"github.com/cilium/cilium/pkg/ip"
+	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/versioncheck"
 )
 
@@ -36,6 +37,66 @@ func extractClientIPFromResponse(t *check.Test, res string) netip.Addr {
 	}
 
 	return ip.Unmap()
+}
+
+// expectedExcludedCIDRSourceIP returns the source IP that excluded-CIDR
+// (non-gateway) traffic from the given client pod is expected to carry when it
+// reaches the external echo.
+//
+// In single-ENI environments (kind, default IPAM) this is simply the node's
+// primary InternalIP (HostIP). With AWS ENI IPAM in native routing mode a node
+// owns multiple ENIs and a pod's IP belongs to whichever ENI allocated it;
+// Cilium masquerades the pod's egress traffic to the primary IP of that owning
+// ENI, because AWS drops packets sourced from an address not assigned to the
+// egressing ENI (see commit 58be8e42aa, Fixes #45137). So when the client pod
+// lives on a secondary ENI the expected source IP is that ENI's primary IP, not
+// HostIP. We fall back to HostIP whenever the owning ENI can't be determined,
+// which keeps the assertion strict: it still fails if excluded traffic is
+// wrongly SNATed to the egress gateway IP, since no client pod's owning-ENI
+// primary matches a gateway node's IP.
+func expectedExcludedCIDRSourceIP(t *check.Test, client check.Pod, ipFam features.IPFamily, hostIP netip.Addr) netip.Addr {
+	ct := t.Context()
+
+	if status, ok := ct.Feature(features.CiliumIPAMMode); !ok || status.Mode != ipamOption.IPAMENI {
+		return hostIP
+	}
+
+	node, ok := ct.CiliumNodes()[check.NodeIdentity{Cluster: client.K8sClient.ClusterName(), Name: client.Pod.Spec.NodeName}]
+	if !ok {
+		return hostIP
+	}
+
+	// Determine the client pod IP of the relevant family.
+	var podIP netip.Addr
+	for _, ipStr := range client.Pod.Status.PodIPs {
+		addr, err := netip.ParseAddr(ipStr.IP)
+		if err != nil {
+			continue
+		}
+		addr = addr.Unmap()
+		if (ipFam == features.IPFamilyV6) == addr.Is6() {
+			podIP = addr
+			break
+		}
+	}
+	if !podIP.IsValid() {
+		return hostIP
+	}
+
+	// Find the ENI that owns the pod IP (either as the ENI primary IP or as one
+	// of its secondary addresses) and return that ENI's primary IP.
+	for _, eni := range node.Status.ENI.ENIs {
+		if ip.CompareUnmap(eni.IP.Addr, podIP) == 0 {
+			return eni.IP.Addr
+		}
+		for _, addr := range eni.Addresses {
+			if ip.CompareUnmap(addr.Addr, podIP) == 0 {
+				return eni.IP.Addr
+			}
+		}
+	}
+
+	return hostIP
 }
 
 // Test pod to host connectivity by using pings. The packet should not get masqueraded with egress
@@ -766,7 +827,8 @@ func (s *egressGatewayExcludedCIDRs) Run(ctx context.Context, t *check.Test) {
 	}
 
 	// Traffic matching an egress gateway policy and an excluded CIDR should leave the cluster masqueraded with the
-	// node IP where the pod is running rather than with the egress IP(pod to external service)
+	// node IP where the pod is running rather than with the egress IP (pod to external service). With ENI IPAM the
+	// expected source is instead the primary IP of the ENI owning the client pod's IP (see expectedExcludedCIDRSourceIP).
 	i := 0
 	for _, client := range ct.ClientPods() {
 		for _, externalEcho := range ct.ExternalEchoPods() {
@@ -787,12 +849,14 @@ func (s *egressGatewayExcludedCIDRs) Run(ctx context.Context, t *check.Test) {
 					}
 				}
 
+				expectedIP := expectedExcludedCIDRSourceIP(t, client, ipFam, hostIP)
+
 				t.NewAction(s, fmt.Sprintf("curl-%s-%d", ipFam, i), &client, externalEcho, ipFam).Run(func(a *check.Action) {
 					a.ExecInPod(ctx, a.CurlCommandWithOutput(externalEcho))
 					clientIP := extractClientIPFromResponse(t, a.CmdOutput())
 
-					if ip.CompareUnmap(clientIP, hostIP) != 0 {
-						a.Failf("Request reached external echo service with wrong source IP: expected: %s, actual %s", hostIP.String(), clientIP.String())
+					if ip.CompareUnmap(clientIP, expectedIP) != 0 {
+						a.Failf("Request reached external echo service with wrong source IP: expected: %s, actual %s", expectedIP.String(), clientIP.String())
 					}
 				})
 			})
