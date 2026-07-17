@@ -45,6 +45,15 @@ func (r regexMatcher) IsMatch(log string) bool {
 	return r.MatchString(log)
 }
 
+// thresholdException tolerates a bad log message up to max occurrences within a
+// single Cilium pod's logs, but reports it as a failure beyond that. It is for
+// messages that are benign in isolation but signal a real problem when they
+// recur, so we keep the signal instead of silencing the message outright.
+type thresholdException struct {
+	matcher logMatcher
+	max     int
+}
+
 // NoErrorsInLogs checks whether there are no error messages in cilium-agent
 // logs. The error messages are defined in badLogMsgsWithExceptions, which key
 // is an error message, while values is a list of ignored messages.
@@ -72,6 +81,19 @@ func NoErrorsInLogs(ciliumVersion semver.Version, checkLevels []string, extraExc
 		envoyExternalTargetTLSWarning, envoyExternalOtherTargetTLSWarning,
 		hubbleUIEnvVarFallback, k8sClientNetworkStatusError, bgpAlphaResourceDeprecation, ccgAlphaResourceDeprecation,
 		k8sEndpointDeprecatedWarn, proxylibDeprecatedWarn, certloaderInitialLoadWarn, localKeyAlreadyAllocated}
+
+	// Bad log messages that are benign in small numbers but signal a real
+	// problem when they recur. Rather than silencing them outright, we tolerate
+	// them up to a bound and fail beyond it, so the signal is kept.
+	warningThresholdExceptions := []thresholdException{
+		// The AWS ENI IPAM operator logs this once per hour per node when a node
+		// hits its ENI/interface budget; the operator itself treats it as "not a
+		// failure scenario" (operator/pkg/ipam/nodemanager/node.go). A single node
+		// briefly at capacity is benign, but the same message from several nodes
+		// means genuine IP starvation worth investigating. cf.
+		// https://github.com/cilium/cilium/issues/42092
+		{matcher: instanceOutOfInterfaces, max: 1},
+	}
 
 	if ciliumVersion.LT(semver.MustParse("1.18.0")) {
 		errorLogExceptions = append(errorLogExceptions, linkNotFound, removeInexistentID)
@@ -110,6 +132,7 @@ func NoErrorsInLogs(ciliumVersion semver.Version, checkLevels []string, extraExc
 	}
 	return &noErrorsInLogs{
 		errorMsgsWithExceptions: errorMsgsWithExceptions,
+		thresholdExceptions:     warningThresholdExceptions,
 		ScenarioBase:            check.NewScenarioBase(),
 		ciliumVersion:           ciliumVersion,
 		startTime:               startTime,
@@ -120,6 +143,7 @@ type noErrorsInLogs struct {
 	check.ScenarioBase
 
 	errorMsgsWithExceptions map[string][]logMatcher
+	thresholdExceptions     []thresholdException
 	ciliumVersion           semver.Version
 	mostCommonFailureLog    string
 	mostCommonFailureCount  int
@@ -367,6 +391,17 @@ func (n *noErrorsInLogs) findUniqueFailures(logs []byte) (map[string]int, map[st
 			}
 		}
 	}
+	// Drop failures that match a threshold exception and stayed within their
+	// tolerated bound; anything above the bound is kept as a real failure.
+	for f, c := range uniqueFailures {
+		for _, te := range n.thresholdExceptions {
+			if te.matcher.IsMatch(exampleLogLine[f]) && c <= te.max {
+				delete(uniqueFailures, f)
+				delete(exampleLogLine, f)
+				break
+			}
+		}
+	}
 	for f, c := range uniqueFailures {
 		if c > n.mostCommonFailureCount {
 			n.mostCommonFailureCount = c
@@ -501,6 +536,7 @@ const (
 
 	k8sEndpointDeprecatedWarn stringMatcher = "v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice" // cf. https://github.com/cilium/cilium/issues/39105
 	proxylibDeprecatedWarn    stringMatcher = "The support for Envoy Go Extensions (proxylib) has been deprecated"          // cf. https://github.com/cilium/cilium/issues/38224
+	instanceOutOfInterfaces   stringMatcher = "Instance is out of interfaces"                                               // AWS ENI-at-capacity; benign for one node, tolerated up to a bound. cf. https://github.com/cilium/cilium/issues/42092
 
 	certloaderInitialLoadWarn stringMatcher = certloader.InitialLoadWarn // Expected when certificates are not yet mounted.
 

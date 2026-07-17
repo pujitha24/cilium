@@ -192,6 +192,33 @@ func TestLeaderElectionLeaseLockErrorMatcher(t *testing.T) {
 	}
 }
 
+func TestInstanceOutOfInterfacesThreshold(t *testing.T) {
+	const line = `time=2026-07-15T20:46:30Z level=warning msg="Instance is out of interfaces" subsys=ipam-allocator-aws name=ip-192-168-170-205.us-west-2.compute.internal`
+
+	for _, tt := range []struct {
+		name       string
+		count      int
+		wantFailed bool
+	}{
+		{name: "one node at capacity is tolerated", count: 1, wantFailed: false},
+		{name: "two nodes at capacity is a failure", count: 2, wantFailed: true},
+		{name: "many nodes at capacity is a failure", count: 5, wantFailed: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var zt time.Time
+			s := NoErrorsInLogs(semver.MustParse("1.19.0"), defaults.LogCheckLevels, nil, "one.one.one.one", "k8s.io", zt).(*noErrorsInLogs)
+			logs := strings.Repeat(line+"\n", tt.count)
+			fails, _ := s.findUniqueFailures([]byte(logs))
+			if tt.wantFailed {
+				assert.Contains(t, fails, "Instance is out of interfaces")
+				assert.Equal(t, tt.count, fails["Instance is out of interfaces"])
+			} else {
+				assert.NotContains(t, fails, "Instance is out of interfaces")
+			}
+		})
+	}
+}
+
 func TestExtractPathFromLog(t *testing.T) {
 	_, thisPath, _, _ := runtime.Caller(0)
 	repoDir, _ := filepath.Abs(filepath.Join(thisPath, "..", "..", "..", ".."))
