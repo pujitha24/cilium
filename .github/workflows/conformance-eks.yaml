@@ -234,7 +234,15 @@ jobs:
           # any command-line injection issues when this lands in --helm-set
           BPF_DATAPATH=$(echo "${EXTRA_ARGS}" | jq -r 'select(.["bpf-datapath"] | type == "string") | .["bpf-datapath"]')
           if [ "${BPF_DATAPATH}" == "netkit" ] || [ "${BPF_DATAPATH}" == "netkit-l2" ]; then
-              echo "::notice::BPFDatapath specified -- setting bpf-datapath=${BPF_DATAPATH} for all matrix entries"
+              # netkit requires kernel 6.7+ and CONFIG_NETKIT; a version whose
+              # AL2023 AMI ships an older kernel (e.g. 1.32 on 6.1) makes
+              # cilium-agent fail hard on startup, so the nodegroup never turns
+              # Ready and eksctl times out. Drop entries not marked
+              # netkit-capable before assigning the datapath so we only target
+              # kernels that can actually run it.
+              echo "::notice::BPFDatapath specified -- dropping non netkit-capable entries and setting bpf-datapath=${BPF_DATAPATH} for the rest"
+              jq 'del(.include[] | select(.["netkit-capable"] != true))' /tmp/result.json > /tmp/result.json.tmp
+              mv /tmp/result.json.tmp /tmp/result.json
               jq '.include |= map(. + {"bpf-datapath": "'${BPF_DATAPATH}'"})' /tmp/result.json > /tmp/result.json.tmp
               mv /tmp/result.json.tmp /tmp/result.json
           fi

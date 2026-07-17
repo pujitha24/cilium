@@ -1,14 +1,21 @@
 # List of k8s version for EKS tests
+#
+# netkit-capable marks versions whose AmazonLinux2023 AMI ships a kernel that
+# can run the netkit datapath (>= 6.7). The 1.32 AMI ships kernel 6.1, so it is
+# intentionally left unmarked and is dropped from netkit runs by conformance-eks.
 ---
 include:
   - version: "1.32"
     region: us-west-1
   - version: "1.33"
     region: us-east-2
+    netkit-capable: true
   - version: "1.34"
     region: us-east-1
     aws-eni-pd: true
+    netkit-capable: true
   - version: "1.35"
     region: us-west-2
     default: true
     aws-eni-pd: true
+    netkit-capable: true
