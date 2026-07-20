@@ -191,7 +191,8 @@ jobs:
           # main -> event_name = schedule
           # other stable branches -> PR-number starting with v (e.g. v1.14)
           # shellcheck disable=SC2193
-          if [[ "${{ github.event_name }}" == "schedule" || "${PR_NUMBER}" == v* ]];then
+          # WIP DO NOT MERGE: force full matrix to exercise all EKS versions/regions
+          if [[ true || "${{ github.event_name }}" == "schedule" || "${PR_NUMBER}" == v* ]];then
             cp eks.json /tmp/matrix.json
           else
             jq '{ "include": [ .include[] | select(.default) ] }' eks.json > /tmp/matrix.json
